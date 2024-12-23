@@ -104,7 +104,7 @@ struct VoiceSample {
     messages: Vec<(String, String)>, // e.g. [("role", "user"), ("content", "Hello")]
 }
 
-async fn run_inference(
+fn run_inference(
     inference_py: &'static CStr,
     mut prompt_rx: mpsc::Receiver<VoiceSample>,
 ) -> Result<mpsc::Receiver<String>, ()> {
@@ -114,56 +114,59 @@ async fn run_inference(
     // Create a channel that will carry VoiceSample messages for inference.
     let (tx, mut inference_rx) = mpsc::channel::<String>(16);
 
-    Python::with_gil(|py| async move {
-        let my_infer_module =
-            PyModule::from_code(py, inference_py, c_str!("main.py"), c_str!("main"))?;
+    tokio::task::spawn_blocking(move || {
+        Python::with_gil(|py| {
+            let my_infer_module =
+                PyModule::from_code(py, inference_py, c_str!("main.py"), c_str!("main"))?;
 
-        let local_inference_class = my_infer_module.getattr("LocalInference")?;
+            let local_inference_class = my_infer_module.getattr("LocalInference")?;
 
-        let model_py = py.None();
-        let processor_py = py.None();
-        let tokenizer_py = py.None();
-        let device = "cpu";
-        let dtype = "float32";
-        let conversation_mode = false;
+            let model_py = py.None();
+            let processor_py = py.None();
+            let tokenizer_py = py.None();
+            let device = "cpu";
+            let dtype = "float32";
+            let conversation_mode = false;
 
-        let local_inference_instance = local_inference_class.call1((
-            model_py,
-            processor_py,
-            tokenizer_py,
-            device,
-            dtype,
-            conversation_mode,
-        ))?;
+            let local_inference_instance = local_inference_class.call1((
+                model_py,
+                processor_py,
+                tokenizer_py,
+                device,
+                dtype,
+                conversation_mode,
+            ))?;
 
-        while let Some(sample) = prompt_rx.recv().await {
-            // Build a Python dict that replicates the `sample` shape.
-            let sample_dict = PyDict::new(py);
+            while let Some(sample) = prompt_rx.blocking_recv() {
+                // Build a Python dict that replicates the `sample` shape.
+                let sample_dict = PyDict::new(py);
 
-            // Our Python code expects sample.messages to be a list of { "role": "...", "content": "..." }
-            let mut py_messages = Vec::new();
-            for (role, content) in &sample.messages {
-                let msg_dict = PyDict::new(py);
-                msg_dict.set_item("role", role)?;
-                msg_dict.set_item("content", content)?;
-                py_messages.push(msg_dict);
+                // Our Python code expects sample.messages to be a list of { "role": "...", "content": "..." }
+                let mut py_messages = Vec::new();
+                for (role, content) in &sample.messages {
+                    let msg_dict = PyDict::new(py);
+                    msg_dict.set_item("role", role)?;
+                    msg_dict.set_item("content", content)?;
+                    py_messages.push(msg_dict);
+                }
+                use pyo3::types::PyDictMethods;
+
+                sample_dict.set_item("messages", py_messages)?;
+
+                // Call local_inference_instance.infer(sample_dict)
+                let inference_result =
+                    local_inference_instance.call_method1("infer", (sample_dict,))?;
+
+                // The returned object is a VoiceOutput with a .text attribute:
+                let answer_text: String = inference_result.getattr("text")?.extract()?;
+                tx.blocking_send(answer_text)
+                    .expect("Failed to send inference result");
             }
-            sample_dict.set_item("messages", py_messages)?;
 
-            // Call local_inference_instance.infer(sample_dict)
-            let inference_result =
-                local_inference_instance.call_method1("infer", (sample_dict,))?;
-
-            // The returned object is a VoiceOutput with a .text attribute:
-            let answer_text: String = inference_result.getattr("text")?.extract()?;
-            tx.send(answer_text).await.unwrap();
-        }
-
-        Ok::<(), PyErr>(())
-    })
-    .await
-    .expect("Python GIL block failed");
-
+            Ok::<(), PyErr>(())
+        })
+        .expect("Python GIL block failed");
+    });
 
     Ok(inference_rx)
 }
