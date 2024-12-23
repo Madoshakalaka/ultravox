@@ -1,12 +1,8 @@
-//! this axum app is the backend wrapper for an LLM.
-//! the core AppState stores sessions. The key of each session is u32. The value use tokio channels
-//! to get output from the LLM.
-
 use std::collections::HashMap;
-use std::ffi::CStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+use axum::http::StatusCode;
 use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
@@ -24,14 +20,13 @@ use tokio::sync::RwLock;
 // Type alias for our session ID
 type SessionId = u32;
 
-// Channel types for LLM communication
-type LlmSender = mpsc::Sender<String>;
+type LlmSender = mpsc::Sender<VoiceSample>;
 type LlmReceiver = mpsc::Receiver<String>;
 
 // Structure to hold active sessions
 #[derive(Default)]
 struct Sessions {
-    sessions: HashMap<SessionId, LlmSender>,
+    sessions: HashMap<SessionId, (LlmSender, Arc<tokio::sync::Mutex<LlmReceiver>>)>,
 }
 
 // Our main application state
@@ -48,9 +43,10 @@ struct PromptRequest {
     prompt: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct NewSessionResponse {
     session_id: SessionId,
+    first_llm_ouput: String,
 }
 
 impl AppState {
@@ -62,52 +58,87 @@ impl AppState {
     }
 }
 
-// Handler to create a new session
-async fn create_session(State(state): State<AppState>) -> Json<NewSessionResponse> {
+async fn create_session(
+    State(state): State<AppState>,
+    Json(query): Json<String>,
+) -> Json<NewSessionResponse> {
     let session_id = state.next_id.fetch_add(1, Ordering::SeqCst);
-    let (tx, _rx) = mpsc::channel(32);
+    let (tx, rx) = mpsc::channel(32);
+    let mut llm_output = run_inference(rx).expect("Failed to start inference");
+    tx.send(VoiceSample {
+        message: query.clone(),
+        first: true,
+    })
+    .await
+    .expect("Failed to send first message");
 
-    let mut sessions = state.sessions.write().await;
-    sessions.sessions.insert(session_id, tx);
-
-    Json(NewSessionResponse { session_id })
+    let first_llm_ouput = llm_output
+        .recv()
+        .await
+        .expect("Failed to receive inference response");
+    {
+        let mut sessions = state.sessions.write().await;
+        sessions.sessions.insert(
+            session_id,
+            (tx, Arc::new(tokio::sync::Mutex::new(llm_output))),
+        );
+    };
+    Json(NewSessionResponse {
+        session_id,
+        first_llm_ouput,
+    })
 }
 
-// Handler to send a prompt to the LLM
 async fn send_prompt(
     State(state): State<AppState>,
     Json(request): Json<PromptRequest>,
-) -> Result<Json<String>, String> {
-    let sessions = state.sessions.read().await;
+) -> Result<Json<String>, (StatusCode, String)> {
+    let recv = {
+        let sessions = state.sessions.read().await;
+        sessions
+            .sessions
+            .get(&request.session_id)
+            .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?
+            .1
+            .clone()
+    };
 
-    if let Some(sender) = sessions.sessions.get(&request.session_id) {
-        // Here you would typically send the prompt to your LLM processing logic
-        // For now, we'll just echo back the prompt
-        sender
-            .send(request.prompt.clone())
-            .await
-            .map_err(|e| e.to_string())?;
+    let mut recv = recv.try_lock().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Session already in use".to_string(),
+        )
+    })?;
 
-        Ok(Json(format!(
-            "Prompt received for session {}",
-            request.session_id
-        )))
-    } else {
-        Err(format!("Session {} not found", request.session_id))
-    }
+    {
+        let sessions = state.sessions.read().await;
+        let (tx, _) = sessions
+            .sessions
+            .get(&request.session_id)
+            .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
+        tx.send(VoiceSample {
+            message: request.prompt.clone(),
+            first: false,
+        })
+        .await
+        .expect("Failed to send message");
+    };
+
+    let response = recv.recv().await.ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Failed to receive response".to_string(),
+    ))?;
+
+    Ok(Json(response))
 }
 
-/// A minimal struct to represent an incoming "voice sample" or message set.
-/// Adjust this to match your real data.
 #[derive(Debug)]
 struct VoiceSample {
-    messages: Vec<(String, String)>, // e.g. [("role", "user"), ("content", "Hello")]
+    message: String,
+    first: bool,
 }
 
-fn run_inference(
-    inference_py: &'static CStr,
-    mut prompt_rx: mpsc::Receiver<VoiceSample>,
-) -> Result<mpsc::Receiver<String>, ()> {
+fn run_inference(mut prompt_rx: mpsc::Receiver<VoiceSample>) -> Result<mpsc::Receiver<String>, ()> {
     // Required if you are going to use Python from multiple threads:
     pyo3::prepare_freethreaded_python();
 
@@ -116,46 +147,62 @@ fn run_inference(
 
     tokio::task::spawn_blocking(move || {
         Python::with_gil(|py| {
-            let my_infer_module =
-                PyModule::from_code(py, inference_py, c_str!("main.py"), c_str!("main"))?;
+            let sys = py.import("sys")?;
+            let path = sys.getattr("path")?;
+            path.call_method1("append", (std::env::var("ULTRAVOX_VENV").unwrap(),))?;
 
-            let local_inference_class = my_infer_module.getattr("LocalInference")?;
+            let my_infer_module = PyModule::from_code(
+                py,
+                c_str!(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../ultravox/inference/ultravox_infer.py"
+                ))),
+                c_str!("ultravox_infer.py"),
+                c_str!("ultravox.inference.ultravox_infer"),
+            )?;
 
-            let model_py = py.None();
-            let processor_py = py.None();
-            let tokenizer_py = py.None();
-            let device = "cpu";
-            let dtype = "float32";
-            let conversation_mode = false;
+            let data_sample_module = PyModule::from_code(
+                py,
+                c_str!(include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../ultravox/data/data_sample.py"
+                ))),
+                c_str!("data_sample.py"),
+                c_str!("ultravox.data.data_sample"),
+            )?;
 
-            let local_inference_instance = local_inference_class.call1((
-                model_py,
-                processor_py,
-                tokenizer_py,
-                device,
-                dtype,
-                conversation_mode,
-            ))?;
+            let inference_class = my_infer_module.getattr("UltravoxInference")?;
 
-            while let Some(sample) = prompt_rx.blocking_recv() {
-                // Build a Python dict that replicates the `sample` shape.
-                let sample_dict = PyDict::new(py);
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("conversation_mode", true)?;
+            let inference_instance =
+                inference_class.call(("fixie-ai/ultravox-v0_4_1-llama-3_1-8b",), Some(&kwargs))?;
 
-                // Our Python code expects sample.messages to be a list of { "role": "...", "content": "..." }
+            while let Some(VoiceSample { message, first }) = prompt_rx.blocking_recv() {
+                // Create message dictionaries first
                 let mut py_messages = Vec::new();
-                for (role, content) in &sample.messages {
-                    let msg_dict = PyDict::new(py);
-                    msg_dict.set_item("role", role)?;
-                    msg_dict.set_item("content", content)?;
-                    py_messages.push(msg_dict);
-                }
-                use pyo3::types::PyDictMethods;
 
-                sample_dict.set_item("messages", py_messages)?;
+                if first {
+                    // prepend a system message
+                    let system_msg_dict = PyDict::new(py);
+                    system_msg_dict.set_item("role", "system")?;
+                    system_msg_dict.set_item("content", include_str!("system_prompt.txt"))?;
+                    py_messages.push(system_msg_dict);
+                }
+                let user_msg_dict = PyDict::new(py);
+                user_msg_dict.set_item("role", "user")?;
+                user_msg_dict.set_item("content", message)?;
+                py_messages.push(user_msg_dict);
+
+                // Get the Sample class from the data_sample module
+                let sample_class = data_sample_module.getattr("VoiceSample")?;
+
+                // Create a new Sample instance with messages
+                let sample_instance = sample_class.call1((py_messages,))?;
 
                 // Call local_inference_instance.infer(sample_dict)
                 let inference_result =
-                    local_inference_instance.call_method1("infer", (sample_dict,))?;
+                    inference_instance.call_method1("infer", (sample_instance,))?;
 
                 // The returned object is a VoiceOutput with a .text attribute:
                 let answer_text: String = inference_result.getattr("text")?.extract()?;
@@ -171,64 +218,71 @@ fn run_inference(
     Ok(inference_rx)
 }
 
-#[tokio::main]
-async fn main() {
-    // Initialize tracing for logging
-    tracing_subscriber::fmt::init();
-
+async fn run(addr: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let app_state = AppState::new();
 
     // Build our application with routes
     let app = Router::new()
-        .route("/session/new", post(create_session))
+        .route("/session", post(create_session))
         .route("/prompt", post(send_prompt))
         // .layer(CorsLayer::permissive())
         .with_state(app_state);
 
     // Run our application
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    println!("Server running on http://127.0.0.1:3000");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("Server running on http://{}", addr);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    // Initialize tracing for logging
+    tracing_subscriber::fmt::init();
+
+    if let Err(e) = run("127.0.0.1:3000".to_string()).await {
+        eprintln!("Server error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
+    use axum::http::StatusCode;
+    use std::net::TcpListener;
+
+    fn find_available_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind random port");
+        listener.local_addr().unwrap().port()
+    }
 
     #[tokio::test]
-    async fn test_run_inference() {
-        let py_mockmain = c_str!(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../mock_ultravox/main.py"
-        )));
+    async fn test_create_session() {
+        // Find an available port
+        let port = find_available_port();
+        let addr = format!("127.0.0.1:{}", port);
 
-        let (tx, rx) = mpsc::channel(32);
+        // Start the server in the background
+        let _server = tokio::spawn(run(addr.clone()));
 
-        // Start the inference process
-        let mut inference_rx = run_inference(py_mockmain, rx).expect("Failed to start inference");
+        // Give the server a moment to start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        // Send a test message
-        let test_message = VoiceSample {
-            messages: vec![
-                ("role".to_string(), "user".to_string()),
-                ("content".to_string(), "Hello, world!".to_string()),
-            ],
-        };
-
-        tx.send(test_message)
+        // Create the client and send the request
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}/session", addr))
+            .json(&"Today my topic is Global Warming".to_string())
+            .send()
             .await
-            .expect("Failed to send test message");
+            .expect("Failed to send request");
 
-        // Receive the response
-        let response = inference_rx
-            .recv()
-            .await
-            .expect("Failed to receive inference response");
+        assert_eq!(response.status(), StatusCode::OK);
 
-        assert_eq!(response, "Hello, world!");
+        let body: NewSessionResponse = response.json().await.expect("Failed to parse response");
+        assert!(body.session_id > 0);
+        assert_eq!(body.first_llm_ouput, "Add Node: Global Warming");
     }
 }
