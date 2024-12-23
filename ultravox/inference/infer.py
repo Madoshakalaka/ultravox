@@ -84,6 +84,7 @@ class LocalInference(base.VoiceInference):
         temperature: Optional[float] = None,
     ) -> base.VoiceOutput:
         extended_sample = self._get_sample_with_past(sample)
+
         inputs = self._dataproc(extended_sample)
         input_len = inputs["input_ids"].shape[1]
         output = self._generate(
@@ -134,6 +135,10 @@ class LocalInference(base.VoiceInference):
         temperature: Optional[float] = None,
     ) -> base.InferenceGenerator:
         extended_sample = self._get_sample_with_past(sample)
+        # todo: implement this properly in rust. This for now also has the bug that it duplicates the system message
+        # print(extended_sample)
+        # # prepend the messages with a system message
+        # extended_sample.messages = [ {"role": "system", "content": "You role is to summarize the user's words as a graph. Never talk to the user directly. Instead, give response in a strict format, where each line is either \"Add Node: SOME_NODE_NAME\" or \"Add Connection: NODE_NAME_A -> NODE_NAME_B\". For example, if the user says \"Today I talk about climate change.\". Your response should be \"Add Node: Climate Change\". when the user continues with \"As we know, cars are a primary cause of it\". Your response should be \"Add Node: Cars\nAdd Connection: Cars -> Climate Change\""} ] + extended_sample.messages
         inputs = self._dataproc(extended_sample)
         input_tokens = inputs["input_ids"].shape[1]
         streamer = transformers.TextIteratorStreamer(
