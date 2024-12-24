@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use axum::http::StatusCode;
-use pyo3::ffi::c_str;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use tokio::sync::mpsc;
@@ -138,38 +138,44 @@ struct VoiceSample {
     first: bool,
 }
 
+static ULTRAVOX_SITE_PACKAGES: LazyLock<String> = LazyLock::new(|| {
+    let output = std::process::Command::new("poetry")
+        .arg("env")
+        .arg("info")
+        .arg("--path")
+        .output()
+        .expect("Failed to run poetry command");
+
+    let path = std::str::from_utf8(&output.stdout).expect("Failed to parse output");
+    let path = path.trim_end();
+    let site_packages = format!("{}/lib/python3.10/site-packages", path);
+    site_packages
+});
+
 fn run_inference(mut prompt_rx: mpsc::Receiver<VoiceSample>) -> Result<mpsc::Receiver<String>, ()> {
     // Required if you are going to use Python from multiple threads:
     pyo3::prepare_freethreaded_python();
 
     // Create a channel that will carry VoiceSample messages for inference.
-    let (tx, mut inference_rx) = mpsc::channel::<String>(16);
+    let (tx, inference_rx) = mpsc::channel::<String>(16);
 
     tokio::task::spawn_blocking(move || {
         Python::with_gil(|py| {
             let sys = py.import("sys")?;
             let path = sys.getattr("path")?;
-            path.call_method1("append", (std::env::var("ULTRAVOX_VENV").unwrap(),))?;
+            // path.call_method1("append", (ULTRAVOX_SITE_PACKAGES.as_str(),))?;
+            path.call_method1("insert", (0, ULTRAVOX_SITE_PACKAGES.as_str()))?;
+            path.call_method1("insert", (0, "/home/maa/Projects/ultravox"))?;
+            println!("Path: {:?}", path);
 
-            let my_infer_module = PyModule::from_code(
-                py,
-                c_str!(include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../ultravox/inference/ultravox_infer.py"
-                ))),
-                c_str!("ultravox_infer.py"),
-                c_str!("ultravox.inference.ultravox_infer"),
-            )?;
+            // print!(env!("PYO3_PYTHON"));
+            // print sys.executable
+            let executable = sys.getattr("executable")?;
+            println!("Executable: {:?}", executable);
 
-            let data_sample_module = PyModule::from_code(
-                py,
-                c_str!(include_str!(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../ultravox/data/data_sample.py"
-                ))),
-                c_str!("data_sample.py"),
-                c_str!("ultravox.data.data_sample"),
-            )?;
+            let my_infer_module = PyModule::import(py, "ultravox.inference.ultravox_infer")?;
+
+            let data_sample_module = PyModule::import(py, "ultravox.data.data_sample")?;
 
             let inference_class = my_infer_module.getattr("UltravoxInference")?;
 
@@ -259,7 +265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_session() {
+    async fn create_session() {
         // Find an available port
         let port = find_available_port();
         let addr = format!("127.0.0.1:{}", port);
